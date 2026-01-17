@@ -4,6 +4,7 @@
 #include "GameInteractor/GameInteractor.h"
 #include "2s2h/Enhancements/Audio/AudioEditor.h"
 #include <libultraship/bridge/consolevariablebridge.h>
+#include <stdio.h>
 
 typedef struct {
     /* 0x0 */ s8 x;
@@ -6123,6 +6124,10 @@ void Audio_SetFileSelectSettings(s8 audioSetting) {
         default:
             break;
     }
+
+    printf("Audio_SetFileSelectSettings: soundMode = %d\n", soundMode);
+
+    Audio_PlaySfx_SurroundSoundTest();
 
     SEQCMD_SET_SOUND_MODE(soundMode);
 }

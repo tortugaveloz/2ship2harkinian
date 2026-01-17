@@ -451,6 +451,8 @@ void BenMenu::AddSettings() {
                      .Format("")
                      .IsPercentage());
     AddWidget(path, "Audio API", WIDGET_AUDIO_BACKEND);
+    AddWidget(path, "Surround 5.1 (needs reload)", WIDGET_CVAR_CHECKBOX)
+        .CVar("gAudioChannelsSetting");
 
     // Graphics Settings
     path.sidebarName = "Graphics";

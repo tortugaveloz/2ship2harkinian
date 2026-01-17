@@ -211,7 +211,8 @@ OTRGlobals::OTRGlobals() {
     overlay->LoadFont("Fipps", 32.0f, "fonts/Fipps-Regular.otf");
     overlay->SetCurrentFont(CVarGetString(CVAR_GAME_OVERLAY_FONT, "Press Start 2P"));
 
-    context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = 1680 });
+    auto audioChannelsSetting = context->GetConfig()->GetCurrentAudioChannelsSetting();
+    context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = 1680, .AudioSurround = audioChannelsSetting });
 
     SPDLOG_INFO("Starting 2 Ship 2 Harkinian version {} (Branch: {} | Commit: {})", (char*)gBuildVersion,
                 (char*)gGitBranch, (char*)gGitCommitHash);
@@ -406,20 +407,64 @@ void OTRAudio_Thread() {
 #define SAMPLES_LOW 528
 
 #define AUDIO_FRAMES_PER_UPDATE (R_UPDATE_RATE > 0 ? R_UPDATE_RATE : 1)
-#define NUM_AUDIO_CHANNELS 2
+#define NUM_AUDIO_CHANNELS_SURROUND 6
+#define NUM_AUDIO_CHANNELS_STEREO 2
+
+        const int32_t num_audio_channels = GetNumAudioChannels();
 
         int samples_left = AudioPlayer_Buffered();
         u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
 
         // 3 is the maximum authentic frame divisor.
-        s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * 3];
+        s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS_SURROUND * 3];
         for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
-            AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS),
+            AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS_STEREO),
                                            num_audio_samples);
         }
 
-        AudioPlayer_Play((u8*)audio_buffer,
-                         num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * AUDIO_FRAMES_PER_UPDATE));
+        if (num_audio_channels == NUM_AUDIO_CHANNELS_SURROUND) {
+            // Transform stereo buffer to 5.1 surround using Dolby Surround (Pro Logic) passive matrix decoding
+            // Process from end to start to avoid overwriting unprocessed data
+            const int total_stereo_samples = num_audio_samples * AUDIO_FRAMES_PER_UPDATE;
+            for (int i = total_stereo_samples - 1; i >= 0; i--) {
+                s16 left = audio_buffer[i * 2];
+                s16 right = audio_buffer[i * 2 + 1];
+
+                // Dolby Surround passive matrix decode
+                s16 center = (left + right) / 2;    // Sum component extracts center
+                s16 surround = (left - right) / 2;  // Difference component extracts surround
+
+                // LFE: mix of all unique channels (left, right, center, surround)
+                // Will be low-pass filtered in the next pass
+                s16 lfe_mix = (left + right + center + surround) / 4;
+
+                // 5.1 channel order: Front Left, Front Right, Center, Subwoofer, Rear Left, Rear Right
+                audio_buffer[i * 6 + 0] = left;      // Front Left
+                audio_buffer[i * 6 + 1] = right;     // Front Right
+                audio_buffer[i * 6 + 2] = center;    // Center
+                audio_buffer[i * 6 + 3] = lfe_mix;   // Subwoofer (LFE) - unfiltered, will be filtered next
+                audio_buffer[i * 6 + 4] = surround;  // Rear Left
+                audio_buffer[i * 6 + 5] = surround;  // Rear Right (duplicate of surround)
+            }
+
+            // Apply 120 Hz low-pass filter to LFE channel
+            // Single-pole IIR filter: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+            // alpha ≈ 2 * pi * fc / fs for fc=120Hz, fs=32000Hz ≈ 0.0236
+            constexpr float lfe_alpha = 0.0236f;
+            static float lfe_filter_state = 0.0f;
+
+            for (int i = 0; i < total_stereo_samples; i++) {
+                float input = static_cast<float>(audio_buffer[i * 6 + 3]);
+                lfe_filter_state = lfe_alpha * input + (1.0f - lfe_alpha) * lfe_filter_state;
+                audio_buffer[i * 6 + 3] = static_cast<s16>(lfe_filter_state);
+            }
+
+            AudioPlayer_Play((u8*)audio_buffer,
+                            num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS_SURROUND * AUDIO_FRAMES_PER_UPDATE));
+        } else {
+            AudioPlayer_Play((u8*)audio_buffer,
+                            num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS_STEREO * AUDIO_FRAMES_PER_UPDATE));
+        }
 
         audio.processing = false;
         audio.cv_from_thread.notify_one();
