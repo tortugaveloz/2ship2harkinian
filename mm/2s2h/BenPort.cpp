@@ -387,6 +387,278 @@ static struct {
     bool processing;
 } audio;
 
+// =============================================================================
+// Dolby Pro Logic II Decoder Implementation
+// Source: https://stackoverflow.com/a - Posted by Sam, modified by community
+// License: CC BY-SA 3.0
+// =============================================================================
+
+namespace DolbyPLII {
+
+constexpr int SAMPLE_RATE = 32000;
+constexpr int DELAY_MS = 10;
+constexpr int DELAY_SAMPLES = (SAMPLE_RATE / 1000) * DELAY_MS;  // 320 samples at 32kHz
+constexpr int MAX_BUFFER_SIZE = 560 * 3;  // SAMPLES_HIGH * max frame divisor
+
+// Dolby Pro Logic II coefficients
+constexpr float COEF_CENTER = 0.35355339059327376220042218105242f;    // 1/(2*sqrt(2))
+constexpr float COEF_FRONT = 0.5f;
+constexpr float COEF_SURR_MAIN = 0.43588989435406735522369819838596f; // sqrt(19)/10
+constexpr float COEF_SURR_CROSS = 0.24494897427831780981972840747059f; // sqrt(6)/10
+
+// Linkwitz-Riley 4th order filter state (24dB/octave)
+struct LRFilterState {
+    double xm1 = 0, xm2 = 0, xm3 = 0, xm4 = 0;
+    double ym1 = 0, ym2 = 0, ym3 = 0, ym4 = 0;
+};
+
+// Linkwitz-Riley filter coefficients
+struct LRFilterCoeffs {
+    double a0, a1, a2, a3, a4;
+    double b1, b2, b3, b4;
+};
+
+LRFilterCoeffs calcLRLowPassCoeffs(double cutoff) {
+    LRFilterCoeffs c;
+    double wc = 2.0 * M_PI * cutoff;
+    double wc2 = wc * wc;
+    double wc3 = wc2 * wc;
+    double wc4 = wc2 * wc2;
+    double k = wc / tan(M_PI * cutoff / SAMPLE_RATE);
+    double k2 = k * k;
+    double k3 = k2 * k;
+    double k4 = k2 * k2;
+    double sqrt2 = sqrt(2.0);
+    double sq_tmp1 = sqrt2 * wc3 * k;
+    double sq_tmp2 = sqrt2 * wc * k3;
+    double a_tmp = 4.0 * wc2 * k2 + 2.0 * sq_tmp1 + k4 + 2.0 * sq_tmp2 + wc4;
+
+    c.b1 = (4.0 * (wc4 + sq_tmp1 - k4 - sq_tmp2)) / a_tmp;
+    c.b2 = (6.0 * wc4 - 8.0 * wc2 * k2 + 6.0 * k4) / a_tmp;
+    c.b3 = (4.0 * (wc4 - sq_tmp1 + sq_tmp2 - k4)) / a_tmp;
+    c.b4 = (k4 - 2.0 * sq_tmp1 + wc4 - 2.0 * sq_tmp2 + 4.0 * wc2 * k2) / a_tmp;
+
+    c.a0 = wc4 / a_tmp;
+    c.a1 = 4.0 * wc4 / a_tmp;
+    c.a2 = 6.0 * wc4 / a_tmp;
+    c.a3 = c.a1;
+    c.a4 = c.a0;
+    return c;
+}
+
+LRFilterCoeffs calcLRHighPassCoeffs(double cutoff) {
+    LRFilterCoeffs c;
+    double wc = 2.0 * M_PI * cutoff;
+    double wc2 = wc * wc;
+    double wc3 = wc2 * wc;
+    double wc4 = wc2 * wc2;
+    double k = wc / tan(M_PI * cutoff / SAMPLE_RATE);
+    double k2 = k * k;
+    double k3 = k2 * k;
+    double k4 = k2 * k2;
+    double sqrt2 = sqrt(2.0);
+    double sq_tmp1 = sqrt2 * wc3 * k;
+    double sq_tmp2 = sqrt2 * wc * k3;
+    double a_tmp = 4.0 * wc2 * k2 + 2.0 * sq_tmp1 + k4 + 2.0 * sq_tmp2 + wc4;
+
+    c.b1 = (4.0 * (wc4 + sq_tmp1 - k4 - sq_tmp2)) / a_tmp;
+    c.b2 = (6.0 * wc4 - 8.0 * wc2 * k2 + 6.0 * k4) / a_tmp;
+    c.b3 = (4.0 * (wc4 - sq_tmp1 + sq_tmp2 - k4)) / a_tmp;
+    c.b4 = (k4 - 2.0 * sq_tmp1 + wc4 - 2.0 * sq_tmp2 + 4.0 * wc2 * k2) / a_tmp;
+
+    c.a0 = k4 / a_tmp;
+    c.a1 = -4.0 * k4 / a_tmp;
+    c.a2 = 6.0 * k4 / a_tmp;
+    c.a3 = c.a1;
+    c.a4 = c.a0;
+    return c;
+}
+
+float applyLRFilter(float input, LRFilterState& state, const LRFilterCoeffs& c) {
+    double tempx = input;
+    double tempy = c.a0 * tempx + c.a1 * state.xm1 + c.a2 * state.xm2 + c.a3 * state.xm3 + c.a4 * state.xm4
+                 - c.b1 * state.ym1 - c.b2 * state.ym2 - c.b3 * state.ym3 - c.b4 * state.ym4;
+    state.xm4 = state.xm3;
+    state.xm3 = state.xm2;
+    state.xm2 = state.xm1;
+    state.xm1 = tempx;
+    state.ym4 = state.ym3;
+    state.ym3 = state.ym2;
+    state.ym2 = state.ym1;
+    state.ym1 = tempy;
+    return static_cast<float>(tempy);
+}
+
+// Phase shifter state
+struct PhaseShiftState {
+    double wp, min_wp, max_wp, sweepfac;
+    double lx1 = 0, ly1 = 0, lx2 = 0, ly2 = 0, lx3 = 0, ly3 = 0, lx4 = 0, ly4 = 0;
+    bool initialized = false;
+};
+
+void initPhaseShift(PhaseShiftState& state) {
+    double depth = 4.0;
+    double delay = 100.0;
+    double rate = 0.1;
+    state.wp = state.min_wp = (M_PI * delay) / SAMPLE_RATE;
+    double range = pow(2.0, depth);
+    state.max_wp = (M_PI * delay * range) / SAMPLE_RATE;
+    rate = pow(range, rate / (SAMPLE_RATE / 2.0));
+    state.sweepfac = rate;
+    state.initialized = true;
+}
+
+float applyPhaseShift(float input, PhaseShiftState& state, bool invert) {
+    if (!state.initialized) initPhaseShift(state);
+
+    double coef = (1.0 - state.wp) / (1.0 + state.wp);
+    double x1 = static_cast<double>(input);
+
+    state.ly1 = coef * (state.ly1 + x1) - state.lx1;
+    state.lx1 = x1;
+    state.ly2 = coef * (state.ly2 + state.ly1) - state.lx2;
+    state.lx2 = state.ly1;
+    state.ly3 = coef * (state.ly3 + state.ly2) - state.lx3;
+    state.lx3 = state.ly2;
+    state.ly4 = coef * (state.ly4 + state.ly3) - state.lx4;
+    state.lx4 = state.ly3;
+
+    double outval = invert ? -state.ly4 : state.ly4;
+
+    // Adjust sweep frequency
+    double rate = pow(pow(2.0, 4.0), 0.1 / (SAMPLE_RATE / 2.0));
+    state.wp *= state.sweepfac;
+    if (state.wp > state.max_wp) {
+        state.sweepfac = 1.0 / rate;
+    } else if (state.wp < state.min_wp) {
+        state.sweepfac = rate;
+    }
+
+    return static_cast<float>(outval);
+}
+
+// Delay buffer
+struct DelayBuffer {
+    float buffer[DELAY_SAMPLES] = {0};
+    int writePos = 0;
+};
+
+float applyDelay(float input, DelayBuffer& delay) {
+    float output = delay.buffer[delay.writePos];
+    delay.buffer[delay.writePos] = input;
+    delay.writePos = (delay.writePos + 1) % DELAY_SAMPLES;
+    return output;
+}
+
+// Persistent state for all filters
+struct PLIIState {
+    // Center channel filters
+    LRFilterState centerHP;
+    LRFilterState centerLP;
+
+    // Surround Left filters
+    LRFilterState slLeftHP;
+    LRFilterState slRightHP;
+    PhaseShiftState slLeftPhase;
+    PhaseShiftState slRightPhase;
+    DelayBuffer slDelay;
+
+    // Surround Right filters
+    LRFilterState srLeftHP;
+    LRFilterState srRightHP;
+    PhaseShiftState srLeftPhase;
+    PhaseShiftState srRightPhase;
+    DelayBuffer srDelay;
+
+    // LFE filter
+    LRFilterState lfeLP;
+
+    // Pre-computed filter coefficients
+    LRFilterCoeffs centerHPCoeffs;
+    LRFilterCoeffs centerLPCoeffs;
+    LRFilterCoeffs surroundHPCoeffs;
+    LRFilterCoeffs lfeLPCoeffs;
+
+    bool initialized = false;
+};
+
+static PLIIState gPLIIState;
+
+void initPLII() {
+    if (gPLIIState.initialized) return;
+    gPLIIState.centerHPCoeffs = calcLRHighPassCoeffs(70.0);
+    gPLIIState.centerLPCoeffs = calcLRLowPassCoeffs(20000.0);
+    gPLIIState.surroundHPCoeffs = calcLRHighPassCoeffs(100.0);
+    gPLIIState.lfeLPCoeffs = calcLRLowPassCoeffs(120.0);
+    gPLIIState.initialized = true;
+}
+
+void processPLII(s16* stereoIn, s16* surroundOut, int numSamples) {
+    initPLII();
+
+    for (int i = 0; i < numSamples; i++) {
+        float left = static_cast<float>(stereoIn[i * 2]);
+        float right = static_cast<float>(stereoIn[i * 2 + 1]);
+
+        // Center channel: (L + R) * 0.707/2, HP 70Hz, LP 20kHz
+        float center = (left * COEF_CENTER) + (right * COEF_CENTER);
+        center = applyLRFilter(center, gPLIIState.centerHP, gPLIIState.centerHPCoeffs);
+        center = applyLRFilter(center, gPLIIState.centerLP, gPLIIState.centerLPCoeffs);
+
+        // Front Left: L * 0.5
+        float frontLeft = left * COEF_FRONT;
+
+        // Front Right: R * 0.5
+        float frontRight = right * COEF_FRONT;
+
+        // Surround Left: L * 0.436 (HP, phase inverted) + R * 0.245 (HP, phase shifted), delayed
+        float slL = left * COEF_SURR_MAIN;
+        slL = applyLRFilter(slL, gPLIIState.slLeftHP, gPLIIState.surroundHPCoeffs);
+        slL = applyPhaseShift(slL, gPLIIState.slLeftPhase, true);  // inverted
+
+        float slR = right * COEF_SURR_CROSS;
+        slR = applyLRFilter(slR, gPLIIState.slRightHP, gPLIIState.surroundHPCoeffs);
+        slR = applyPhaseShift(slR, gPLIIState.slRightPhase, false);
+
+        float surroundLeft = applyDelay(slL + slR, gPLIIState.slDelay);
+
+        // Surround Right: L * 0.245 (HP, phase inverted) + R * 0.436 (HP, phase shifted), delayed
+        float srL = left * COEF_SURR_CROSS;
+        srL = applyLRFilter(srL, gPLIIState.srLeftHP, gPLIIState.surroundHPCoeffs);
+        srL = applyPhaseShift(srL, gPLIIState.srLeftPhase, true);  // inverted
+
+        float srR = right * COEF_SURR_MAIN;
+        srR = applyLRFilter(srR, gPLIIState.srRightHP, gPLIIState.surroundHPCoeffs);
+        srR = applyPhaseShift(srR, gPLIIState.srRightPhase, false);
+
+        float surroundRight = applyDelay(srL + srR, gPLIIState.srDelay);
+
+        // LFE: (L + R) * 0.707/2, LP 120Hz
+        float lfe = (left * COEF_CENTER) + (right * COEF_CENTER);
+        lfe = applyLRFilter(lfe, gPLIIState.lfeLP, gPLIIState.lfeLPCoeffs);
+
+        // Clamp and output (5.1 channel order: FL, FR, C, LFE, RL, RR)
+        auto clampToS16 = [](float v) -> s16 {
+            if (v > 32767.0f) return 32767;
+            if (v < -32768.0f) return -32768;
+            return static_cast<s16>(v);
+        };
+
+        surroundOut[i * 6 + 0] = clampToS16(frontLeft);
+        surroundOut[i * 6 + 1] = clampToS16(frontRight);
+        surroundOut[i * 6 + 2] = clampToS16(center);
+        surroundOut[i * 6 + 3] = clampToS16(lfe);
+        surroundOut[i * 6 + 4] = clampToS16(surroundLeft);
+        surroundOut[i * 6 + 5] = clampToS16(surroundRight);
+    }
+}
+
+} // namespace DolbyPLII
+
+// =============================================================================
+// End Dolby Pro Logic II Decoder
+// =============================================================================
+
 void OTRAudio_Thread() {
     while (audio.running) {
         {
@@ -423,43 +695,14 @@ void OTRAudio_Thread() {
         }
 
         if (num_audio_channels == NUM_AUDIO_CHANNELS_SURROUND) {
-            // Transform stereo buffer to 5.1 surround using Dolby Surround (Pro Logic) passive matrix decoding
-            // Process from end to start to avoid overwriting unprocessed data
+            // Decode stereo to 5.1 surround using Dolby Pro Logic II
             const int total_stereo_samples = num_audio_samples * AUDIO_FRAMES_PER_UPDATE;
-            for (int i = total_stereo_samples - 1; i >= 0; i--) {
-                s16 left = audio_buffer[i * 2];
-                s16 right = audio_buffer[i * 2 + 1];
 
-                // Dolby Surround passive matrix decode
-                s16 center = (left + right) / 2;    // Sum component extracts center
-                s16 surround = (left - right) / 2;  // Difference component extracts surround
+            // Need separate output buffer since PLII processes forward (can't do in-place backwards)
+            s16 surround_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS_SURROUND * 3];
+            DolbyPLII::processPLII(audio_buffer, surround_buffer, total_stereo_samples);
 
-                // LFE: mix of all unique channels (left, right, center, surround)
-                // Will be low-pass filtered in the next pass
-                s16 lfe_mix = (left + right + center + surround) / 4;
-
-                // 5.1 channel order: Front Left, Front Right, Center, Subwoofer, Rear Left, Rear Right
-                audio_buffer[i * 6 + 0] = left;      // Front Left
-                audio_buffer[i * 6 + 1] = right;     // Front Right
-                audio_buffer[i * 6 + 2] = center;    // Center
-                audio_buffer[i * 6 + 3] = lfe_mix;   // Subwoofer (LFE) - unfiltered, will be filtered next
-                audio_buffer[i * 6 + 4] = surround;  // Rear Left
-                audio_buffer[i * 6 + 5] = surround;  // Rear Right (duplicate of surround)
-            }
-
-            // Apply 120 Hz low-pass filter to LFE channel
-            // Single-pole IIR filter: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
-            // alpha ≈ 2 * pi * fc / fs for fc=120Hz, fs=32000Hz ≈ 0.0236
-            constexpr float lfe_alpha = 0.0236f;
-            static float lfe_filter_state = 0.0f;
-
-            for (int i = 0; i < total_stereo_samples; i++) {
-                float input = static_cast<float>(audio_buffer[i * 6 + 3]);
-                lfe_filter_state = lfe_alpha * input + (1.0f - lfe_alpha) * lfe_filter_state;
-                audio_buffer[i * 6 + 3] = static_cast<s16>(lfe_filter_state);
-            }
-
-            AudioPlayer_Play((u8*)audio_buffer,
+            AudioPlayer_Play((u8*)surround_buffer,
                             num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS_SURROUND * AUDIO_FRAMES_PER_UPDATE));
         } else {
             AudioPlayer_Play((u8*)audio_buffer,
